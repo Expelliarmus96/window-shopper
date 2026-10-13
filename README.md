@@ -1,0 +1,1 @@
+Window shopper. Just looking.

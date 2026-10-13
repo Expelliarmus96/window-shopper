@@ -1,0 +1,43 @@
+name: Window Shopper
+
+on:
+  workflow_dispatch:           # triggered by cron-job.org every 30 min
+
+# Prevent overlapping runs. A run still waiting on a runner won't stack up
+# behind the next trigger; the newer run takes over.
+concurrency:
+  group: window-shopper
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    # Pinned instead of ubuntu-latest so a runner-image migration can't surprise
+    # us; 24.04 is the current ubuntu-latest as of 2026-08.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12        # kill the job if it hangs (2 min cart wait + buffer)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium + system deps
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run session
+        env:
+          SELLPY_EMAIL: ${{ secrets.SELLPY_EMAIL }}
+          SELLPY_PASSWORD: ${{ secrets.SELLPY_PASSWORD }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python window_shopper.py

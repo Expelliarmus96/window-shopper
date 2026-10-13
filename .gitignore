@@ -1,0 +1,11 @@
+.env
+DOCUMENTATION.md
+__pycache__/
+*.py[cod]
+*.png
+*_snapshot.html
+cart_loggedin.html
+inspect_dom.py
+inspect_cart.py
+auth_onedrive.py
+onedrive_log.py
