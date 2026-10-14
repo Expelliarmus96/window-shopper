@@ -31,10 +31,14 @@ SLOW_MO = 0
 
 BASE = "https://www.sellpy.se"
 
-# Favorites page. Leave SELLPY_FAVORITES_URL unset and the bot finds the
-# heart link in the site header; set it if that discovery ever breaks.
-FAVORITES_URL = os.getenv("SELLPY_FAVORITES_URL", "").strip()
-FAVORITES_FALLBACK_PATHS = ["/favorites", "/favoriter", "/my-shopping/favorites"]
+# The "300+" favorites list. fill goes straight here. Override with the
+# SELLPY_FAVORITES_URL variable, or set it to "auto" to make the bot find the
+# favorites page itself and click the list named SELLPY_FAVORITES_LIST.
+_DEFAULT_LIST_URL = f"{BASE}/my-shopping/favorites/list/PMQH2pUIu3"
+FAVORITES_URL = os.getenv("SELLPY_FAVORITES_URL", "").strip() or _DEFAULT_LIST_URL
+if FAVORITES_URL.lower() == "auto":
+    FAVORITES_URL = ""
+FAVORITES_FALLBACK_PATHS = ["/my-shopping/favorites", "/favorites"]
 # Only items in this favorites list are added. If SELLPY_FAVORITES_URL already
 # points straight at the list, the name is only used for logging.
 FAVORITES_LIST = os.getenv("SELLPY_FAVORITES_LIST", "").strip() or "300+"
@@ -336,22 +340,92 @@ def _open_favorites_page(page) -> bool:
 
 
 def _collect_item_ids(page) -> list:
-    """Scroll the current page until no new items load; return unique item ids."""
-    root = page.locator("main").first if page.locator("main").count() else page
-    ids, stable_rounds = [], 0
-    for _ in range(60):
-        before = len(ids)
+    """Return unique item ids on the current list, across all pages.
+
+    Handles all three ways a long list can be split: infinite scroll,
+    a "Visa fler" (show more) button, and numbered pages with a next link.
+    """
+    ids = []
+
+    def harvest():
+        root = page.locator("main").first if page.locator("main").count() else page
         for lnk in root.locator("a[href*='/item/']").all():
             href = lnk.get_attribute("href") or ""
             item_id = href.rstrip("/").split("/item/")[-1].split("?")[0]
             if item_id and item_id not in ids:
                 ids.append(item_id)
-        stable_rounds = stable_rounds + 1 if len(ids) == before else 0
-        if stable_rounds >= 3:
+
+    show_more = page.locator(
+        "button:has-text('Visa fler'), button:has-text('Ladda fler'), "
+        "button:has-text('Visa mer'), button:has-text('Show more'), "
+        "button:has-text('Load more')"
+    ).first
+    next_page = page.locator(
+        "a[rel='next'], a[aria-label*='Nästa'], button[aria-label*='Nästa'], "
+        "a[aria-label*='Next'], button[aria-label*='Next'], "
+        "a:has([data-testid='icon-CHEVRON_RIGHT']), button:has([data-testid='icon-CHEVRON_RIGHT'])"
+    ).first
+
+    for page_no in range(1, 51):                      # hard cap: 50 pages
+        stable_rounds = 0
+        for _ in range(60):                           # scroll + "show more"
+            before = len(ids)
+            harvest()
+            if len(ids) == before:
+                stable_rounds += 1
+                try:
+                    if show_more.is_visible():
+                        show_more.scroll_into_view_if_needed()
+                        show_more.click()
+                        log.info("Clicked 'show more'…")
+                        page.wait_for_timeout(2_000)
+                        stable_rounds = 0
+                        continue
+                except PWTimeout:
+                    pass
+            else:
+                stable_rounds = 0
+            if stable_rounds >= 3:
+                break
+            page.mouse.wheel(0, 2_500)
+            page.wait_for_timeout(1_000)
+
+        log.info(f"Page {page_no}: {len(ids)} items collected so far")
+        try:
+            if not (next_page.is_visible() and next_page.is_enabled()
+                    and next_page.get_attribute("aria-disabled") != "true"):
+                break
+            before = len(ids)
+            url_before = page.url
+            next_page.scroll_into_view_if_needed()
+            next_page.click()
+            page.wait_for_timeout(3_000)
+            harvest()
+            if len(ids) == before and page.url == url_before:
+                break                                  # next did nothing: last page
+        except PWTimeout:
             break
-        page.mouse.wheel(0, 2_500)
-        page.wait_for_timeout(1_000)
     return ids
+
+
+_SKIP_REASONS = [
+    ("in cart", ["I varukorgen", "Ligger i varukorgen", "Gå till varukorgen"]),
+    ("sold", ["Såld", "Sålt", "Slutsåld"]),
+    ("reserved", ["Reserverad", "Reserverat", "Någon annan har den i sin varukorg"]),
+]
+
+
+def _skip_reason(page) -> str:
+    """Best guess at why an item has no add-to-cart button."""
+    root = page.locator("main").first if page.locator("main").count() else page
+    for reason, phrases in _SKIP_REASONS:
+        for phrase in phrases:
+            try:
+                if root.get_by_text(phrase).first.is_visible():
+                    return reason
+            except Exception:
+                pass
+    return "unknown"
 
 
 def run_fill(dry_run: bool = False):
@@ -359,6 +433,8 @@ def run_fill(dry_run: bool = False):
     log.info(f"Starting FILL session{' (dry run)' if dry_run else ''}…")
     t_start = time.monotonic()
     added, skipped, cart_items = [], [], -1
+    reasons = {}
+    unknown_shots = 0
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO)
@@ -394,14 +470,20 @@ def run_fill(dry_run: bool = False):
                     added.append(item_id)
                     log.info(f"Added {item_id} ({len(added)} so far)")
                 except PWTimeout:
-                    # Sold, reserved, or already in the cart.
+                    reason = _skip_reason(page)
                     skipped.append(item_id)
-                    log.info(f"Skipped {item_id} — no add-to-cart button")
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                    log.info(f"Skipped {item_id} — {reason}")
+                    if reason == "unknown" and unknown_shots < 3:
+                        unknown_shots += 1
+                        page.screenshot(path=f"skip_{item_id}.png", full_page=True)
 
             cart_items = _cart_count(page)
-            log.info(f"FILL done: {len(added)} added, {len(skipped)} skipped, cart now {cart_items}")
+            why = ", ".join(f"{n} {r}" for r, n in reasons.items())
+            log.info(f"FILL done: {len(added)} added, {len(skipped)} skipped ({why}), cart now {cart_items}")
             sheets_log.log_run(
-                "success", f"FILL {FAVORITES_LIST}: {len(added)} added, {len(skipped)} skipped",
+                "success",
+                f"FILL {FAVORITES_LIST}: {len(added)} added, {len(skipped)} skipped" + (f" ({why})" if why else ""),
                 time.monotonic() - t_start, cart_items,
             )
         except Exception as exc:

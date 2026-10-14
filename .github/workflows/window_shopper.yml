@@ -4,7 +4,7 @@ on:
   workflow_dispatch:           # triggered by cron-job.org
     inputs:
       mode:
-        description: "cycle = add+remove one item (every 30 min), fill = add all favorites (05:40), empty = clear cart (01:10)"
+        description: "cycle = add+remove one item (every 30 min), fill = add the 300+ favorites list (05:40), empty = clear cart (01:10)"
         type: choice
         options: [cycle, fill, empty]
         default: cycle
@@ -53,6 +53,7 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           SELLPY_FAVORITES_URL: ${{ vars.SELLPY_FAVORITES_URL }}
+          SELLPY_FAVORITES_LIST: ${{ vars.SELLPY_FAVORITES_LIST }}   # empty = "300+"
           MODE: ${{ inputs.mode || 'cycle' }}
           DRY_RUN: ${{ inputs.dry_run || false }}
         run: python window_shopper.py
