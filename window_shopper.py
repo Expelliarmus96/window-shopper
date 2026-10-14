@@ -2,7 +2,10 @@
 window_shopper.py
 Logs in to sellpy.se and runs one of three modes:
 
-  cycle (default)  add a product to cart, wait, remove it (every 30 min)
+  cycle (default)  every 30 min: add any "300+" items missing from the cart;
+                   if none were added, add a random product, wait, remove it.
+                   (Between 01:00 and 05:40 only the random add/remove runs,
+                   so the nightly empty isn't undone.)
   fill             add every available item from one favorites list
                    (SELLPY_FAVORITES_LIST, default "300+") to the cart
   empty            remove every item from the cart
@@ -12,6 +15,7 @@ Usage: python window_shopper.py [--mode cycle|fill|empty] [--dry-run]
 Runs headless. Triggered exclusively via GitHub Actions — not intended for local use.
 """
 import argparse
+import datetime
 import logging
 import os
 import time
@@ -42,6 +46,13 @@ FAVORITES_FALLBACK_PATHS = ["/my-shopping/favorites", "/favorites"]
 # Only items in this favorites list are added. If SELLPY_FAVORITES_URL already
 # points straight at the list, the name is only used for logging.
 FAVORITES_LIST = os.getenv("SELLPY_FAVORITES_LIST", "").strip() or "300+"
+
+# cycle doesn't top up from the list in this window (cart is emptied at 01:10
+# and refilled by fill at 05:40). Stockholm time, (hour, minute).
+NIGHT_START, NIGHT_END = (1, 0), (5, 40)
+# cycle stops adding list items after this long, so it stays within the
+# workflow's 12-minute timeout. Anything left is picked up next cycle.
+CYCLE_FAVORITES_BUDGET_S = 7 * 60
 
 ADD_BTN = "button:has-text('Lägg i varukorg')"
 TRASH_BTN = "button:not([aria-label='Close banner']):has([data-testid='icon-TRASH'])"
@@ -146,6 +157,33 @@ def run_session():
             # ── 1. Login ──────────────────────────────────────────────────────
             if not _login(page):
                 return
+
+            # ── 1b. Top up from the favorites list ────────────────────────────
+            # Any "300+" items not in the cart get added. If at least one was
+            # added, that's this run's activity — skip the random add/remove.
+            if _in_night_window():
+                log.info("Night window — skipping the favorites top-up.")
+            else:
+                try:
+                    _, missing = _missing_from_cart(page)
+                    if missing:
+                        added, skipped, reasons = _add_items(
+                            page, missing, deadline=t_start + CYCLE_FAVORITES_BUDGET_S)
+                        if added:
+                            _cart_items = _cart_count(page)
+                            log.info(f"Topped up {len(added)} from '{FAVORITES_LIST}', cart now "
+                                     f"{_cart_items} — skipping random add/remove.")
+                            sheets_log.log_run(
+                                "success",
+                                f"{FAVORITES_LIST}: {len(added)} added"
+                                + (f", {len(skipped)} skipped ({_why(reasons)})" if skipped else ""),
+                                time.monotonic() - t_start, _cart_items,
+                            )
+                            return
+                    log.info("Nothing from the list could be added — doing a random add/remove.")
+                except Exception as exc:
+                    # Don't let a favorites problem stop the regular cycle.
+                    log.warning(f"Favorites top-up failed ({exc}) — doing a random add/remove.")
 
             # ── 2. Navigate to a product ──────────────────────────────────────
             log.info("Fetching homepage to find a product…")
@@ -408,13 +446,84 @@ def _skip_reason(page) -> str:
     return "unknown"
 
 
+def _in_night_window() -> bool:
+    from zoneinfo import ZoneInfo
+    now = datetime.datetime.now(ZoneInfo("Europe/Stockholm"))
+    return NIGHT_START <= (now.hour, now.minute) < NIGHT_END
+
+
+def _cart_html(page) -> str:
+    """Open the cart, scroll through it so every row renders, return its HTML."""
+    page.goto(f"{BASE}/checkout/cart", wait_until="load", timeout=60_000)
+    page.wait_for_timeout(3_000)
+    _close_banner(page)
+    last_height = -1
+    for _ in range(40):
+        height = page.evaluate("document.body.scrollHeight")
+        if height == last_height:
+            break
+        last_height = height
+        page.mouse.wheel(0, 3_000)
+        page.wait_for_timeout(600)
+    return page.content()
+
+
+def _add_items(page, item_ids, deadline=None):
+    """Open each item and click add-to-cart. Returns (added, skipped, reasons).
+
+    Stops early (leaving the rest for later) if `deadline` (monotonic) passes.
+    """
+    added, skipped, reasons, unknown_shots = [], [], {}, 0
+    for item_id in item_ids:
+        if deadline and time.monotonic() > deadline:
+            log.info(f"Time budget used up — {len(item_ids) - len(added) - len(skipped)} items left for next run.")
+            break
+        page.goto(f"{BASE}/item/{item_id}", wait_until="load", timeout=60_000)
+        page.wait_for_timeout(1_500)
+        _close_banner(page)
+        btn = page.locator(ADD_BTN).first
+        try:
+            btn.wait_for(state="visible", timeout=5_000)
+            btn.scroll_into_view_if_needed()
+            btn.click()
+            page.wait_for_timeout(1_500)
+            added.append(item_id)
+            log.info(f"Added {item_id} ({len(added)} so far)")
+        except PWTimeout:
+            reason = _skip_reason(page)
+            skipped.append(item_id)
+            reasons[reason] = reasons.get(reason, 0) + 1
+            log.info(f"Skipped {item_id} — {reason}")
+            if reason == "unknown" and unknown_shots < 3:
+                unknown_shots += 1
+                page.screenshot(path=f"skip_{item_id}.png", full_page=True)
+    return added, skipped, reasons
+
+
+def _missing_from_cart(page):
+    """Return (list_ids, ids on the list that aren't in the cart)."""
+    if not _open_favorites(page):
+        raise RuntimeError(f"favorites list '{FAVORITES_LIST}' not found")
+    list_ids = _collect_item_ids(page)
+    if not list_ids:
+        page.screenshot(path="error_favorites.png")
+        raise RuntimeError(f"List '{FAVORITES_LIST}' opened but no items were found")
+    html = _cart_html(page)
+    missing = [i for i in list_ids if i not in html]
+    log.info(f"List '{FAVORITES_LIST}': {len(list_ids)} items, "
+             f"{len(list_ids) - len(missing)} already in cart, {len(missing)} not in cart")
+    return list_ids, missing
+
+
+def _why(reasons: dict) -> str:
+    return ", ".join(f"{n} {r}" for r, n in reasons.items())
+
+
 def run_fill(dry_run: bool = False):
-    """Add every available item on the favorites list to the cart."""
+    """Add every available item on the favorites list that isn't already in the cart."""
     log.info(f"Starting FILL session{' (dry run)' if dry_run else ''}…")
     t_start = time.monotonic()
-    added, skipped, cart_items = [], [], -1
-    reasons = {}
-    unknown_shots = 0
+    added, cart_items = [], -1
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS, slow_mo=SLOW_MO)
@@ -424,46 +533,23 @@ def run_fill(dry_run: bool = False):
             if not _login(page):
                 sheets_log.log_run("failure", "FILL", time.monotonic() - t_start, -1, "login failed")
                 return
-            if not _open_favorites(page):
-                sheets_log.log_run("failure", "FILL", time.monotonic() - t_start, -1, f"favorites list '{FAVORITES_LIST}' not found")
-                return
 
-            item_ids = _collect_item_ids(page)
-            log.info(f"List '{FAVORITES_LIST}' ({page.url}) has {len(item_ids)} items: {item_ids}")
-            if not item_ids:
-                page.screenshot(path="error_favorites.png")
-                raise RuntimeError(f"List '{FAVORITES_LIST}' opened but no items were found")
+            list_ids, missing = _missing_from_cart(page)
+            log.info(f"Not in cart: {missing}")
             if dry_run:
                 log.info("Dry run — not adding anything.")
                 return
 
-            for item_id in item_ids:
-                page.goto(f"{BASE}/item/{item_id}", wait_until="load", timeout=60_000)
-                page.wait_for_timeout(1_500)
-                _close_banner(page)
-                btn = page.locator(ADD_BTN).first
-                try:
-                    btn.wait_for(state="visible", timeout=5_000)
-                    btn.scroll_into_view_if_needed()
-                    btn.click()
-                    page.wait_for_timeout(1_500)
-                    added.append(item_id)
-                    log.info(f"Added {item_id} ({len(added)} so far)")
-                except PWTimeout:
-                    reason = _skip_reason(page)
-                    skipped.append(item_id)
-                    reasons[reason] = reasons.get(reason, 0) + 1
-                    log.info(f"Skipped {item_id} — {reason}")
-                    if reason == "unknown" and unknown_shots < 3:
-                        unknown_shots += 1
-                        page.screenshot(path=f"skip_{item_id}.png", full_page=True)
-
+            added, skipped, reasons = _add_items(page, missing)
+            in_cart = len(list_ids) - len(missing)
             cart_items = _cart_count(page)
-            why = ", ".join(f"{n} {r}" for r, n in reasons.items())
-            log.info(f"FILL done: {len(added)} added, {len(skipped)} skipped ({why}), cart now {cart_items}")
+            log.info(f"FILL done: {len(added)} added, {in_cart} already in cart, "
+                     f"{len(skipped)} skipped ({_why(reasons)}), cart now {cart_items}")
             sheets_log.log_run(
                 "success",
-                f"FILL {FAVORITES_LIST}: {len(added)} added, {len(skipped)} skipped" + (f" ({why})" if why else ""),
+                f"FILL {FAVORITES_LIST}: {len(added)} added, {len(skipped)} skipped"
+                + (f" ({_why(reasons)})" if reasons else "")
+                + (f", {in_cart} already in cart" if in_cart else ""),
                 time.monotonic() - t_start, cart_items,
             )
         except Exception as exc:
