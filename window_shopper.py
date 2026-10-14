@@ -339,71 +339,51 @@ def _open_favorites_page(page) -> bool:
     return False
 
 
-def _collect_item_ids(page) -> list:
-    """Return unique item ids on the current list, across all pages.
+def _page_url(url: str, n: int) -> str:
+    """Return `url` with its ?page= query parameter set to n."""
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+    parts = urlparse(url)
+    query = parse_qs(parts.query)
+    query["page"] = [str(n)]
+    return urlunparse(parts._replace(query=urlencode(query, doseq=True)))
 
-    Handles all three ways a long list can be split: infinite scroll,
-    a "Visa fler" (show more) button, and numbered pages with a next link.
+
+def _collect_item_ids(page) -> list:
+    """Return unique item ids on the current list, across all its pages.
+
+    Sellpy splits favorites lists into pages of 60 items, each at its own
+    address (...?page=2, ...?page=3). We open page 1, 2, 3… in turn and stop
+    at the first page that adds no new items.
     """
     ids = []
 
-    def harvest():
-        root = page.locator("main").first if page.locator("main").count() else page
-        for lnk in root.locator("a[href*='/item/']").all():
-            href = lnk.get_attribute("href") or ""
-            item_id = href.rstrip("/").split("/item/")[-1].split("?")[0]
-            if item_id and item_id not in ids:
-                ids.append(item_id)
-
-    show_more = page.locator(
-        "button:has-text('Visa fler'), button:has-text('Ladda fler'), "
-        "button:has-text('Visa mer'), button:has-text('Show more'), "
-        "button:has-text('Load more')"
-    ).first
-    next_page = page.locator(
-        "a[rel='next'], a[aria-label*='Nästa'], button[aria-label*='Nästa'], "
-        "a[aria-label*='Next'], button[aria-label*='Next'], "
-        "a:has([data-testid='icon-CHEVRON_RIGHT']), button:has([data-testid='icon-CHEVRON_RIGHT'])"
-    ).first
-
-    for page_no in range(1, 51):                      # hard cap: 50 pages
-        stable_rounds = 0
-        for _ in range(60):                           # scroll + "show more"
-            before = len(ids)
-            harvest()
-            if len(ids) == before:
-                stable_rounds += 1
-                try:
-                    if show_more.is_visible():
-                        show_more.scroll_into_view_if_needed()
-                        show_more.click()
-                        log.info("Clicked 'show more'…")
-                        page.wait_for_timeout(2_000)
-                        stable_rounds = 0
-                        continue
-                except PWTimeout:
-                    pass
-            else:
-                stable_rounds = 0
-            if stable_rounds >= 3:
+    def harvest() -> int:
+        """Collect ids on the page as loaded (scrolling for lazy items)."""
+        before, stable_rounds = len(ids), 0
+        for _ in range(30):
+            n = len(ids)
+            root = page.locator("main").first if page.locator("main").count() else page
+            for lnk in root.locator("a[href*='/item/']").all():
+                href = lnk.get_attribute("href") or ""
+                item_id = href.rstrip("/").split("/item/")[-1].split("?")[0]
+                if item_id and item_id not in ids:
+                    ids.append(item_id)
+            stable_rounds = stable_rounds + 1 if len(ids) == n else 0
+            if stable_rounds >= 2:
                 break
             page.mouse.wheel(0, 2_500)
-            page.wait_for_timeout(1_000)
+            page.wait_for_timeout(800)
+        return len(ids) - before
 
-        log.info(f"Page {page_no}: {len(ids)} items collected so far")
-        try:
-            if not (next_page.is_visible() and next_page.is_enabled()
-                    and next_page.get_attribute("aria-disabled") != "true"):
-                break
-            before = len(ids)
-            url_before = page.url
-            next_page.scroll_into_view_if_needed()
-            next_page.click()
-            page.wait_for_timeout(3_000)
-            harvest()
-            if len(ids) == before and page.url == url_before:
-                break                                  # next did nothing: last page
-        except PWTimeout:
+    base_url = page.url
+    for page_no in range(1, 51):                      # hard cap: 50 pages
+        if page_no > 1:
+            page.goto(_page_url(base_url, page_no), wait_until="load", timeout=60_000)
+            page.wait_for_timeout(2_500)
+            _close_banner(page)
+        new = harvest()
+        log.info(f"Page {page_no}: {new} new items, {len(ids)} total")
+        if new == 0:
             break
     return ids
 
