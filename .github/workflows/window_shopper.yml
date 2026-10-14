@@ -1,20 +1,32 @@
 name: Window Shopper
 
 on:
-  workflow_dispatch:           # triggered by cron-job.org every 30 min
+  workflow_dispatch:           # triggered by cron-job.org
+    inputs:
+      mode:
+        description: "cycle = add+remove one item (every 30 min), fill = add all favorites (05:40), empty = clear cart (01:10)"
+        type: choice
+        options: [cycle, fill, empty]
+        default: cycle
+      dry_run:
+        description: "fill/empty only: log what would happen without changing the cart"
+        type: boolean
+        default: false
 
-# Prevent overlapping runs. A run still waiting on a runner won't stack up
-# behind the next trigger; the newer run takes over.
+# One concurrency group per mode. Regular cycle runs still replace each other
+# (newer cancels pending), but a cycle trigger can never cancel the nightly
+# fill/empty runs, and those are never cancelled mid-way.
 concurrency:
-  group: window-shopper
-  cancel-in-progress: true
+  group: window-shopper-${{ inputs.mode || 'cycle' }}
+  cancel-in-progress: ${{ (inputs.mode || 'cycle') == 'cycle' }}
 
 jobs:
   run-bot:
     # Pinned instead of ubuntu-latest so a runner-image migration can't surprise
     # us; 24.04 is the current ubuntu-latest as of 2026-08.
     runs-on: ubuntu-24.04
-    timeout-minutes: 12        # kill the job if it hangs (2 min cart wait + buffer)
+    # cycle: 2 min cart wait + buffer. fill/empty walk the whole list, so allow more.
+    timeout-minutes: ${{ (inputs.mode == 'fill' || inputs.mode == 'empty') && 40 || 12 }}
 
     steps:
       - name: Checkout code
@@ -40,4 +52,15 @@ jobs:
           SELLPY_PASSWORD: ${{ secrets.SELLPY_PASSWORD }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          SELLPY_FAVORITES_URL: ${{ vars.SELLPY_FAVORITES_URL }}
+          MODE: ${{ inputs.mode || 'cycle' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
         run: python window_shopper.py
+
+      - name: Upload error screenshots (if any)
+        if: always()               # script logs errors itself and exits 0, so always check
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_id }}
+          path: '*.png'
+          if-no-files-found: ignore
