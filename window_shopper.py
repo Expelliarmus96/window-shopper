@@ -453,19 +453,37 @@ def _in_night_window() -> bool:
 
 
 def _cart_html(page) -> str:
-    """Open the cart, scroll through it so every row renders, return its HTML."""
+    """Open the cart and return the HTML of the cart ROWS only.
+
+    Only the rows (the smallest block around each trash button that has an
+    image) count. The rest of the page can't be used: Sellpy embeds the
+    user's favourites in every page, so every favourite's id appears in the
+    page HTML even when the cart is empty.
+    """
     page.goto(f"{BASE}/checkout/cart", wait_until="load", timeout=60_000)
     page.wait_for_timeout(3_000)
     _close_banner(page)
     last_height = -1
-    for _ in range(40):
+    for _ in range(40):                       # scroll so every row renders
         height = page.evaluate("document.body.scrollHeight")
         if height == last_height:
             break
         last_height = height
         page.mouse.wheel(0, 3_000)
         page.wait_for_timeout(600)
-    return page.content()
+    rows = page.evaluate("""() => {
+        const out = [];
+        for (const b of document.querySelectorAll('button')) {
+            if (!b.querySelector('[data-testid="icon-TRASH"]')) continue;
+            if (b.getAttribute('aria-label') === 'Close banner') continue;
+            let el = b.parentElement;
+            while (el && !el.querySelector('img, a[href*="/item/"]')) el = el.parentElement;
+            if (el) out.push(el.outerHTML);
+        }
+        return out;
+    }""")
+    log.info(f"Cart has {len(rows)} rows")
+    return "\n".join(rows)
 
 
 def _add_items(page, item_ids, deadline=None):
