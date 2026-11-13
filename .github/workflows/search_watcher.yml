@@ -2,9 +2,8 @@ name: Search Watcher
 
 # Checks the searches in the "Search watcher" tab of the log sheet and puts
 # newly listed items into the favorites list (WATCH_LIST_URL).
+# Triggered only by cron-job.org (workflow_dispatch), every 4 hours.
 on:
-  schedule:
-    - cron: '17,47 * * * *'    # every 30 min, off the :00/:30 cart-bot runs
   workflow_dispatch:
     inputs:
       dry_run:
