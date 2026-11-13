@@ -39,7 +39,7 @@ from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
 # Reuse login, banner handling and list reading from the cart bot.
 from window_shopper import (
     BASE, EMAIL, HEADLESS, PASSWORD, SLOW_MO,
-    _close_banner, _login, _page_url,
+    _close_banner, _collect_item_ids, _harvest, _login, _wait_rendered,
 )
 
 log = logging.getLogger("search_watcher")
@@ -165,39 +165,6 @@ def _sorted_url(url: str) -> str:
     return urlunparse(parts._replace(query=urlencode(q, doseq=True)))
 
 
-# Item links on a page, skipping the "Du kanske också gillar" carousel
-# (data-testid="scroll-slider"), which shows up under lists and searches.
-_ITEM_LINKS_JS = """() => [...document.querySelectorAll("main article a[href*='/item/']")]
-    .filter(a => !a.closest("[data-testid='scroll-slider']"))
-    .map(a => a.getAttribute('href').split('/item/')[1].split(/[/?#]/)[0])
-    .filter(Boolean)"""
-
-
-def _wait_rendered(page):
-    """Item tiles render a few seconds after 'load'; wait for the first one."""
-    try:
-        page.wait_for_selector("main article a[href*='/item/']", timeout=15_000)
-    except PWTimeout:
-        pass
-    page.wait_for_timeout(1_500)
-
-
-def _harvest(page, ids: list, want: int = 10_000) -> int:
-    """Add the page's item ids to `ids` (scrolling for lazy tiles)."""
-    before, stable = len(ids), 0
-    for _ in range(30):
-        n = len(ids)
-        for item_id in page.evaluate(_ITEM_LINKS_JS):
-            if item_id not in ids:
-                ids.append(item_id)
-        stable = stable + 1 if len(ids) == n else 0
-        if stable >= 2 or len(ids) >= want:
-            break
-        page.mouse.wheel(0, 2_500)
-        page.wait_for_timeout(700)
-    return len(ids) - before
-
-
 def _search_ids(page, url: str) -> list:
     """Item ids of a search, newest first (first page only)."""
     page.goto(_sorted_url(url), wait_until="load", timeout=60_000)
@@ -218,16 +185,9 @@ def _confirmed_empty(page) -> bool:
 
 
 def _list_item_ids(page) -> list:
-    """Item ids in the watch list, across all its ?page=N pages."""
-    ids = []
-    for page_no in range(1, 51):
-        page.goto(LIST_URL if page_no == 1 else _page_url(LIST_URL, page_no),
-                  wait_until="load", timeout=60_000)
-        _wait_rendered(page)
-        _close_banner(page)
-        if _harvest(page, ids) == 0:
-            break
-    return ids
+    """Item ids in the watch list, across all its pages (carousel excluded)."""
+    page.goto(LIST_URL, wait_until="load", timeout=60_000)
+    return _collect_item_ids(page)
 
 
 def _list_name(page) -> str:

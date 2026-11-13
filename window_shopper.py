@@ -386,40 +386,56 @@ def _page_url(url: str, n: int) -> str:
     return urlunparse(parts._replace(query=urlencode(query, doseq=True)))
 
 
+# Item links on a page, skipping the "Du kanske också gillar" carousel
+# (data-testid="scroll-slider") that Sellpy shows under lists and searches.
+_ITEM_LINKS_JS = """() => [...document.querySelectorAll("main article a[href*='/item/']")]
+    .filter(a => !a.closest("[data-testid='scroll-slider']"))
+    .map(a => a.getAttribute('href').split('/item/')[1].split(/[/?#]/)[0])
+    .filter(Boolean)"""
+
+
+def _wait_rendered(page):
+    """Item tiles render a few seconds after 'load'; wait for the first one."""
+    try:
+        page.wait_for_selector("main article a[href*='/item/']", timeout=15_000)
+    except PWTimeout:
+        pass
+    page.wait_for_timeout(1_500)
+
+
+def _harvest(page, ids: list, want: int = 10_000) -> int:
+    """Add the current page's item ids (carousel excluded) to `ids`,
+    scrolling for lazy tiles. Returns how many were new."""
+    before, stable = len(ids), 0
+    for _ in range(30):
+        n = len(ids)
+        for item_id in page.evaluate(_ITEM_LINKS_JS):
+            if item_id not in ids:
+                ids.append(item_id)
+        stable = stable + 1 if len(ids) == n else 0
+        if stable >= 2 or len(ids) >= want:
+            break
+        page.mouse.wheel(0, 2_500)
+        page.wait_for_timeout(800)
+    return len(ids) - before
+
+
 def _collect_item_ids(page) -> list:
     """Return unique item ids on the current list, across all its pages.
 
     Sellpy splits favorites lists into pages of 60 items, each at its own
-    address (...?page=2, ...?page=3). We open page 1, 2, 3… in turn and stop
-    at the first page that adds no new items.
+    address (...?page=2, ...?page=3). We read page 1, 2, 3… in turn and stop
+    at the first page that adds no new items. The recommendation carousel
+    under the list is ignored. Shared with search_watcher.py.
     """
     ids = []
-
-    def harvest() -> int:
-        """Collect ids on the page as loaded (scrolling for lazy items)."""
-        before, stable_rounds = len(ids), 0
-        for _ in range(30):
-            n = len(ids)
-            root = page.locator("main").first if page.locator("main").count() else page
-            for lnk in root.locator("a[href*='/item/']").all():
-                href = lnk.get_attribute("href") or ""
-                item_id = href.rstrip("/").split("/item/")[-1].split("?")[0]
-                if item_id and item_id not in ids:
-                    ids.append(item_id)
-            stable_rounds = stable_rounds + 1 if len(ids) == n else 0
-            if stable_rounds >= 2:
-                break
-            page.mouse.wheel(0, 2_500)
-            page.wait_for_timeout(800)
-        return len(ids) - before
-
     base_url = page.url
     for page_no in range(1, 51):                      # hard cap: 50 pages
         if page_no > 1:
             page.goto(_page_url(base_url, page_no), wait_until="load", timeout=60_000)
-            page.wait_for_timeout(2_500)
-            _close_banner(page)
-        new = harvest()
+        _wait_rendered(page)
+        _close_banner(page)
+        new = _harvest(page, ids)
         log.info(f"Page {page_no}: {new} new items, {len(ids)} total")
         if new == 0:
             break
