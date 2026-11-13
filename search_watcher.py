@@ -8,14 +8,24 @@ tab, the first time the script runs. URLs listed in searches.txt are appended
 to the tab on each run if they aren't there yet (existing rows are never
 changed, moved or deleted).
 
-For each search, sorted by "latest" (sortBy=saleStartedAt_desc):
-  * The tab remembers the ids of the 5 newest items from the previous run.
-  * Everything above the first of those that is still listed is new: it gets
-    favorited and put in the list (WATCH_LIST_URL).
-  * The 5 newest ids are then stored for next time.
-  * A search with no stored ids (first run) is only recorded, nothing is added.
-  * If none of the stored ids is listed any more, nothing is added and the
-    search is re-recorded, so a glitch can never favorite a whole search.
+For each search, sorted by "latest" (sortBy=saleStartedAt_desc), first page:
+  * Each item's first-listed time (firstOfferedAt_SE) is read from the
+    search's own data. Sellpy's "latest" order is not strictly by date, so
+    position in the list is not used to decide what is new.
+  * New = first listed after the newest listing time stored for the search
+    (column newest_listed_at), wherever it sits in the list. It gets
+    favorited and put in the list (WATCH_LIST_URL), oldest first, at most
+    15 per search per run. Items that come back on sale (e.g. after a cart
+    reservation runs out) keep their old listing time and are not new.
+  * The newest listing time and the 5 newest ids are then stored. The ids
+    are a backup for items without a listing time, and for when no times
+    can be read at all: then only items above the first stored id still
+    listed count, and nothing is added if none of them is listed any more.
+  * A search with nothing stored (first run) is only recorded.
+  * A row stored before listing times existed: items listed after its
+    last_checked time are new; the newest listing time is then stored.
+  * A search Sellpy confirms is empty stores "(empty)" and the current time,
+    so whatever is first listed after that counts as new.
 
 Afterwards the list is opened to verify every added item is really in it.
 
@@ -52,13 +62,18 @@ SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
 CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
 TAB = "Search watcher"
 HEADER = ["search_url", "label", "latest_ids", "last_checked", "last_status",
-          "last_added", "total_added"]
+          "last_added", "total_added", "newest_listed_at"]
 SEED_SEARCHES = [["https://www.sellpy.se/search?query=brighten", "brighten"]]
 
 MARKERS = 5             # newest ids remembered per search
 MAX_NEW_PER_SEARCH = 15 # safety cap per search per run
 SORT = "saleStartedAt_desc"
 EMPTY = "(empty)"       # latest_ids marker: Sellpy confirmed the search had no items
+# When an item was first put on sale on sellpy.se (ms since epoch), from the
+# search's Algolia response. Unlike saleStartedAt it is NOT reset when an item
+# comes back on sale (e.g. after a cart reservation runs out).
+LISTED_FIELD = "firstOfferedAt_SE"
+_UTC = datetime.timezone.utc
 _STHLM = ZoneInfo("Europe/Stockholm")
 
 
@@ -97,10 +112,21 @@ def _read_searches(ws):
     return out
 
 
+def _ensure_columns(ws):
+    """Tabs created before newest_listed_at existed have 7 columns: add the
+    missing column(s) and header cells. Existing cells are not touched."""
+    if ws.col_count < len(HEADER):
+        ws.add_cols(len(HEADER) - ws.col_count)
+    head = ws.row_values(1)
+    if len(head) < len(HEADER):
+        first = len(head)
+        ws.update(range_name=f"{chr(65 + first)}1", values=[HEADER[first:]])
+
+
 def _write_result(ws, row_no, rec):
-    ws.update(range_name=f"C{row_no}:G{row_no}", values=[[
+    ws.update(range_name=f"C{row_no}:H{row_no}", values=[[
         rec["latest_ids"], rec["last_checked"], rec["last_status"],
-        rec["last_added"], rec["total_added"],
+        rec["last_added"], rec["total_added"], rec["newest_listed_at"],
     ]])
 
 
@@ -168,14 +194,48 @@ def _sorted_url(url: str) -> str:
     return urlunparse(parts._replace(query=urlencode(q, doseq=True)))
 
 
-def _search_ids(page, url: str) -> list:
-    """Item ids of a search, newest first (first page only)."""
-    page.goto(_sorted_url(url), wait_until="load", timeout=60_000)
-    _wait_rendered(page)
-    _close_banner(page)
-    ids = []
-    _harvest(page, ids, want=30)
-    return ids
+def _listing_times(responses, ids: list) -> dict:
+    """{item_id: first-listed ms} from the Algolia responses the search page
+    made. Picks the result whose hits best match the tiles we read."""
+    best, best_overlap = None, 0
+    for r in responses:
+        try:
+            data = r.json()
+        except Exception:
+            continue
+        for res in data.get("results", []):
+            hits = res.get("hits") or []
+            overlap = len({h.get("objectID") for h in hits} & set(ids))
+            if overlap > best_overlap:
+                best, best_overlap = hits, overlap
+    times = {}
+    for h in best or []:
+        t = h.get(LISTED_FIELD)
+        if h.get("objectID") in ids and isinstance(t, (int, float)) and t > 0:
+            times[h["objectID"]] = int(t)
+    return times
+
+
+def _search_ids(page, url: str):
+    """(item ids of a search in page order, {id: first-listed ms}).
+    First page only (up to 60 items); ids without a known time are left out
+    of the dict."""
+    responses = []
+
+    def grab(r):
+        if "algolia" in r.url and "/queries" in r.url:
+            responses.append(r)
+
+    page.on("response", grab)
+    try:
+        page.goto(_sorted_url(url), wait_until="load", timeout=60_000)
+        _wait_rendered(page)
+        _close_banner(page)
+        ids = []
+        _harvest(page, ids, want=30)
+    finally:
+        page.remove_listener("response", grab)
+    return ids, _listing_times(responses, ids)
 
 
 def _confirmed_empty(page) -> bool:
@@ -281,6 +341,113 @@ def _favorite_to_list(page, item_id: str, list_name: str) -> str:
     return "ok"
 
 
+# ── What counts as new ────────────────────────────────────────────────────────
+
+def _fmt_ms(ms) -> str:
+    if ms is None:
+        return ""
+    dt = datetime.datetime.fromtimestamp(ms / 1000, _UTC)
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _parse_ms(text):
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_UTC)
+    return int(dt.timestamp() * 1000)
+
+
+def _parse_checked_ms(text):
+    """last_checked is written as Stockholm local time."""
+    try:
+        dt = datetime.datetime.strptime((text or "").strip(), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return int(dt.replace(tzinfo=_STHLM).timestamp() * 1000)
+
+
+def _decide(ids, times, rec, now_ms, empty_confirmed=False):
+    """Decide what is new in one search. Pure function (no browser, no sheet).
+
+    ids    item ids in page order; times {id: first-listed ms} (may be partial)
+    rec    the search's row (latest_ids, newest_listed_at, last_checked, ...)
+    Returns (new ids oldest first, row updates, status, log level, message).
+    status is None when the caller should go on and add `new`.
+
+    New = first listed after the stored newest listing time, wherever the
+    item sits in the list. Items that come back on sale keep their old
+    listing time, so they never count. The stored ids are a backup, for
+    items without a listing time.
+    """
+    markers = [m.strip() for m in (rec.get("latest_ids") or "").split(",") if m.strip()]
+    real_markers = [m for m in markers if m != EMPTY]
+    stored = _parse_ms(rec.get("newest_listed_at"))
+    known = [times[i] for i in ids if i in times]
+    newest = max(known) if known else None
+    top = ",".join(ids[:MARKERS])
+
+    def latest(*vals):
+        vals = [v for v in vals if v is not None]
+        return _fmt_ms(max(vals)) if vals else ""
+
+    # Nothing listed.
+    if not ids:
+        if not empty_confirmed:
+            return [], {}, "no results", "warning", "no results — keeping the stored point."
+        # Sellpy itself says the search is empty: anything listed from now on is new.
+        status = ("baseline recorded (no items yet)" if not (markers or stored)
+                  else "no items listed")
+        return ([], {"latest_ids": EMPTY, "newest_listed_at": latest(stored, now_ms)}, status,
+                "info", "no items listed (confirmed) — anything listed from now on counts as new.")
+
+    # Very first run: only record.
+    if not markers and stored is None:
+        return ([], {"latest_ids": top, "newest_listed_at": latest(newest), "last_added": ""},
+                "baseline recorded", "info",
+                f"first run — recording newest listing {_fmt_ms(newest) or '(unknown)'}, nothing added.")
+
+    # Where "new" starts.
+    if stored is not None:
+        cutoff, how = stored, "listed after the stored newest listing"
+    else:
+        # A row from before listing times were stored: what was listed at the
+        # previous check is not new, so new starts at that check.
+        cutoff, how = _parse_checked_ms(rec.get("last_checked")), "listed after the previous check"
+        if cutoff is None:
+            return ([], {"latest_ids": top, "newest_listed_at": latest(newest)},
+                    "listing time recorded, nothing added", "info",
+                    "no stored listing time or previous check — recording the newest listing, nothing added.")
+
+    hit = next((i for i, x in enumerate(ids) if x in real_markers), None)
+    if not known:
+        # No listing times at all (Algolia response missing): fall back to the
+        # stored ids, the old way — only what is above them is new.
+        if hit is None:
+            return ([], {"latest_ids": top}, "no listing times and stored ids gone — nothing added",
+                    "warning", "no listing times and none of the stored ids are listed — nothing added.")
+        new, how, level = ids[:hit], "no listing times — used the stored ids", "warning"
+    else:
+        timed_new = sorted((i for i in ids if i in times and times[i] > cutoff),
+                           key=lambda i: -times[i])                      # newest first
+        # Backup for items without a listing time: new only if above the
+        # first stored id that is still listed.
+        untimed_new = [i for i in ids[:hit or 0] if i not in times]
+        new, level = untimed_new + timed_new, "info"
+
+    updates = {"latest_ids": top, "newest_listed_at": latest(stored, newest)}
+    if len(new) > MAX_NEW_PER_SEARCH:
+        how += f"; {len(new)} new — only adding the newest {MAX_NEW_PER_SEARCH}"
+        level = "warning"
+        new = new[:MAX_NEW_PER_SEARCH]
+    return list(reversed(new)), updates, None, level, how
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(dry_run: bool) -> bool:
@@ -293,6 +460,8 @@ def run(dry_run: bool) -> bool:
         searches = [(i, dict(zip(HEADER, r + [""] * (len(HEADER) - len(r)))))
                     for i, r in enumerate(SEED_SEARCHES, start=2)]
     else:
+        if not dry_run:
+            _ensure_columns(ws)
         added = _sync_file_searches(ws, dry_run)
         searches = _read_searches(ws)
         if dry_run and added:
@@ -321,9 +490,8 @@ def run(dry_run: bool) -> bool:
             results = {}
             for row_no, rec in searches:
                 label = rec["label"] or rec["search_url"]
-                markers = [m for m in rec["latest_ids"].split(",") if m.strip()]
                 try:
-                    ids = _search_ids(page, rec["search_url"])
+                    ids, times = _search_ids(page, rec["search_url"])
                 except Exception as exc:
                     ok_all = False
                     log.error(f"[{label}] search failed: {exc}")
@@ -332,45 +500,25 @@ def run(dry_run: bool) -> bool:
                     results[row_no] = rec
                     continue
 
-                if not ids:
-                    if _confirmed_empty(page):
-                        # Sellpy itself says there are no items, so whatever
-                        # shows up later is new.
-                        log.info(f"[{label}] no items listed (confirmed) — recording an empty starting point.")
-                        rec.update(latest_ids=EMPTY, last_checked=now,
-                                   last_status="baseline recorded (no items yet)")
-                    else:
-                        log.warning(f"[{label}] no results — keeping the stored ids.")
-                        rec.update(last_checked=now, last_status="no results")
+                new, updates, status, level, msg = _decide(
+                    ids, times, rec, int(time.time() * 1000),
+                    empty_confirmed=(not ids and _confirmed_empty(page)))
+                if ids and len(times) < len(ids):
+                    log.info(f"[{label}] listing time known for {len(times)}/{len(ids)} items.")
+                if status is not None:                     # nothing to add this run
+                    getattr(log, level)(f"[{label}] {msg}")
+                    if not dry_run:
+                        rec.update(updates)
+                    rec.update(last_checked=now, last_status=status)
                     results[row_no] = rec
                     continue
-
-                if markers == [EMPTY]:
-                    hit = len(ids)               # was empty: everything listed is new
-                else:
-                    hit = next((i for i, x in enumerate(ids) if x in markers), None)
-                if not markers:
-                    log.info(f"[{label}] first run — recording {ids[:MARKERS]}, nothing added.")
-                    rec.update(latest_ids=",".join(ids[:MARKERS]), last_checked=now,
-                               last_status="baseline recorded", last_added="")
-                    results[row_no] = rec
-                    continue
-                if hit is None:
-                    log.warning(f"[{label}] none of the stored ids are listed any more — "
-                                "re-recording, nothing added.")
-                    rec.update(latest_ids=",".join(ids[:MARKERS]), last_checked=now,
-                               last_status="stored ids gone — re-recorded, nothing added")
-                    results[row_no] = rec
-                    continue
-
-                new = ids[:hit]
-                if len(new) > MAX_NEW_PER_SEARCH:
-                    log.warning(f"[{label}] {len(new)} new — only adding the newest {MAX_NEW_PER_SEARCH}.")
-                    new = new[:MAX_NEW_PER_SEARCH]
-                log.info(f"[{label}] {len(new)} new: {new}")
+                getattr(log, level)(f"[{label}] {len(new)} new ({msg})" + (":" if new else "."))
+                for item_id in new:
+                    log.info(f"[{label}]   {item_id}  listed {_fmt_ms(times.get(item_id)) or '(time unknown)'}"
+                             f"  position {ids.index(item_id) + 1}")
 
                 done, problems = [], []
-                for item_id in reversed(new):            # oldest first
+                for item_id in new:                      # oldest first
                     if dry_run:
                         done.append(item_id)
                         continue
@@ -396,7 +544,7 @@ def run(dry_run: bool) -> bool:
                 if new:
                     rec["last_added"] = ",".join(done)
                 if not dry_run:
-                    rec["latest_ids"] = ",".join(ids[:MARKERS])
+                    rec.update(updates)
                     rec["total_added"] = str(int(rec["total_added"] or 0) + len(done))
                 results[row_no] = rec
 
