@@ -13,7 +13,10 @@ For each search, sorted by "latest" (sortBy=saleStartedAt_desc), first page:
     search's own data. Sellpy's "latest" order is not strictly by date, so
     position in the list is not used to decide what is new.
   * New = first listed after the newest listing time stored for the search
-    (column newest_listed_at), wherever it sits in the list. It gets
+    (column newest_listed_at) AND after the previous successful check
+    (minus 15 min for Sellpy's indexing delay), wherever it sits in the
+    list. Something listed before the previous check that wasn't seen then
+    was hidden (e.g. reserved in a cart) and is back on sale. It gets
     favorited and put in the list (WATCH_LIST_URL), oldest first, at most
     15 per search per run. Items that come back on sale (e.g. after a cart
     reservation runs out) keep their old listing time and are not new.
@@ -73,6 +76,7 @@ EMPTY = "(empty)"       # latest_ids marker: Sellpy confirmed the search had no 
 # search's Algolia response. Unlike saleStartedAt it is NOT reset when an item
 # comes back on sale (e.g. after a cart reservation runs out).
 LISTED_FIELD = "firstOfferedAt_SE"
+CHECK_MARGIN_MS = 15 * 60 * 1000   # Sellpy indexing delay allowance (see _decide)
 _UTC = datetime.timezone.utc
 _STHLM = ZoneInfo("Europe/Stockholm")
 
@@ -424,9 +428,17 @@ def _decide(ids, times, rec, now_ms, empty_confirmed=False):
                 "baseline recorded", "info",
                 f"first run — recording newest listing {_fmt_ms(newest) or '(unknown)'}, nothing added.")
 
-    # Where "new" starts.
+    # Where "new" starts. Something first listed before the previous check
+    # was either seen then (so it's at or below `stored`) or hidden then,
+    # e.g. reserved in someone's cart — so it's back on sale, not new. Only
+    # a check that actually read the search counts, and Sellpy needs a
+    # minute or two to index a new item, hence the margin.
+    prev_ok = not (rec.get("last_status") or "").startswith(("error", "run failed", "no results"))
+    prev_check = _parse_checked_ms(rec.get("last_checked")) if prev_ok else None
     if stored is not None:
         cutoff, how = stored, "listed after the stored newest listing"
+        if prev_check is not None and prev_check - CHECK_MARGIN_MS > stored:
+            cutoff, how = prev_check - CHECK_MARGIN_MS, "listed after the previous check"
     else:
         # A row from before listing times were stored: what was listed at the
         # previous check is not new, so new starts at that check.
