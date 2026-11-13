@@ -61,7 +61,9 @@ _STHLM = ZoneInfo("Europe/Stockholm")
 
 # ── Google Sheet ──────────────────────────────────────────────────────────────
 
-def _open_tab():
+def _open_tab(create: bool = True):
+    """Return the tab, creating it if needed. With create=False a missing tab
+    gives None (a dry run must not touch the sheet)."""
     import gspread
     if not CREDS_JSON or not SHEET_ID:
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON / GOOGLE_SHEET_ID not set")
@@ -69,6 +71,8 @@ def _open_tab():
     try:
         return sh.worksheet(TAB)
     except gspread.WorksheetNotFound:
+        if not create:
+            return None
         # Always after the existing tabs: the Apps Script reads the FIRST tab
         # as the cart-bot log.
         ws = sh.add_worksheet(TAB, rows=100, cols=len(HEADER), index=len(sh.worksheets()))
@@ -214,8 +218,14 @@ def _favorite_to_list(page, item_id: str, list_name: str) -> str:
 def run(dry_run: bool) -> bool:
     """Returns True if everything went fine."""
     t0 = time.monotonic()
-    ws = _open_tab()
-    searches = _read_searches(ws)
+    ws = _open_tab(create=not dry_run)
+    if ws is None:
+        # Dry run before the tab exists: check the starter searches in memory.
+        log.info(f"No '{TAB}' tab yet — dry run uses the starter search(es); the sheet is not touched.")
+        searches = [(i, dict(zip(HEADER, r + [""] * (len(HEADER) - len(r)))))
+                    for i, r in enumerate(SEED_SEARCHES, start=2)]
+    else:
+        searches = _read_searches(ws)
     log.info(f"{len(searches)} search(es) to check{' (dry run)' if dry_run else ''}.")
     if not searches:
         return True
