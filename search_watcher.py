@@ -58,6 +58,7 @@ SEED_SEARCHES = [["https://www.sellpy.se/search?query=brighten", "brighten"]]
 MARKERS = 5             # newest ids remembered per search
 MAX_NEW_PER_SEARCH = 15 # safety cap per search per run
 SORT = "saleStartedAt_desc"
+EMPTY = "(empty)"       # latest_ids marker: Sellpy confirmed the search had no items
 _STHLM = ZoneInfo("Europe/Stockholm")
 
 
@@ -205,6 +206,15 @@ def _search_ids(page, url: str) -> list:
     ids = []
     _harvest(page, ids, want=30)
     return ids
+
+
+def _confirmed_empty(page) -> bool:
+    """True if the search page shows Sellpy's own "no items" message (as
+    opposed to a page that just didn't load)."""
+    try:
+        return page.get_by_text("Inga fler varor med dina filter").first.is_visible(timeout=2_000)
+    except PWTimeout:
+        return False
 
 
 def _list_item_ids(page) -> list:
@@ -360,12 +370,22 @@ def run(dry_run: bool) -> bool:
                     continue
 
                 if not ids:
-                    log.warning(f"[{label}] no results — keeping the stored ids.")
-                    rec.update(last_checked=now, last_status="no results")
+                    if _confirmed_empty(page):
+                        # Sellpy itself says there are no items, so whatever
+                        # shows up later is new.
+                        log.info(f"[{label}] no items listed (confirmed) — recording an empty starting point.")
+                        rec.update(latest_ids=EMPTY, last_checked=now,
+                                   last_status="baseline recorded (no items yet)")
+                    else:
+                        log.warning(f"[{label}] no results — keeping the stored ids.")
+                        rec.update(last_checked=now, last_status="no results")
                     results[row_no] = rec
                     continue
 
-                hit = next((i for i, x in enumerate(ids) if x in markers), None)
+                if markers == [EMPTY]:
+                    hit = len(ids)               # was empty: everything listed is new
+                else:
+                    hit = next((i for i, x in enumerate(ids) if x in markers), None)
                 if not markers:
                     log.info(f"[{label}] first run — recording {ids[:MARKERS]}, nothing added.")
                     rec.update(latest_ids=",".join(ids[:MARKERS]), last_checked=now,
