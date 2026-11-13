@@ -1,0 +1,14 @@
+# Searches for search_watcher.py, one "url | label" per line.
+# Each run appends any URL here that isn't in the "Search watcher" tab yet.
+# Removing a line here does NOT remove it from the tab; delete the row there.
+https://www.sellpy.se/search?brand=Buodbuid | Buodbuid
+https://www.sellpy.se/search?brand=KTM | KTM
+https://www.sellpy.se/search?brand=Extralight | Extralight
+https://www.sellpy.se/search?brand=Manisa | Manisa
+https://www.sellpy.se/search?brand=Thermofibre&brand=Thermolayer&brand=Thermomix&brand=Thermore&brand=Thermolate&brand=Mega+Thermo&brand=Thermopoc&brand=Thermowave&brand=Thermo+Form&brand=Thermo+Soft&brand=Thermolactyl&brand=Thermotic&brand=Thermo+Master&brand=Thermobaby&brand=Thermo+Leggings&brand=Thermo+Meter&brand=Thermolite+Micro&brand=C%26A+x+Thermolite&brand=Thermo+Fleece&brand=Thermo+Max&brand=Thermo+Shaper&brand=Thermo+Socks&brand=Thermo+Tech&brand=Thermo+Therm&brand=ThermoDr&brand=Thermocafe+by+Thermos&brand=Thermoloden+Maresima&brand=Thermoval&brand=Thermo&brand=Thermolite | Thermo (all)
+https://www.sellpy.se/search?query=mtb&brand=MTB | MTB
+https://www.sellpy.se/search?brand=Puma&type=Bikini&type=Bikiniunderdel&sizes=WMN-INT-L&sizes=WMN-INT-XL | Puma bikini L/XL
+https://www.sellpy.se/search?brand=Polartec | Polartec
+https://www.sellpy.se/search?brand=Premium+Down | Premium Down
+https://www.sellpy.se/search?brand=Primaloft | Primaloft
+https://www.sellpy.se/search?brand=Recco | Recco

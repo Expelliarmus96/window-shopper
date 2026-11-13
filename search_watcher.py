@@ -4,7 +4,9 @@ Watches Sellpy searches and puts newly listed items into one favorites list.
 
 The searches live in the "Search watcher" tab of the log spreadsheet, one per
 row (column A = search URL). The tab is created automatically, after the log
-tab, the first time the script runs.
+tab, the first time the script runs. URLs listed in searches.txt are appended
+to the tab on each run if they aren't there yet (existing rows are never
+changed, moved or deleted).
 
 For each search, sorted by "latest" (sortBy=saleStartedAt_desc):
   * The tab remembers the ids of the 5 newest items from the previous run.
@@ -99,6 +101,57 @@ def _write_result(ws, row_no, rec):
         rec["latest_ids"], rec["last_checked"], rec["last_status"],
         rec["last_added"], rec["total_added"],
     ]])
+
+
+SEARCHES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "searches.txt")
+
+
+def _url_key(url: str) -> str:
+    """Compare search URLs ignoring host case, trailing slash and query order."""
+    parts = urlparse(url.strip())
+    q = sorted((k, v) for k, vs in parse_qs(parts.query).items() for v in vs if k != "page")
+    return f"{parts.netloc.lower()}{parts.path.rstrip('/')}?{urlencode(q)}"
+
+
+def _file_searches() -> list:
+    """[url, label] pairs from searches.txt ("url | label" per line, # = comment)."""
+    if not os.path.exists(SEARCHES_FILE):
+        return []
+    out = []
+    with open(SEARCHES_FILE, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            url, _, label = line.partition("|")
+            if url.strip().startswith("http"):
+                out.append([url.strip(), label.strip()])
+    return out
+
+
+def _sync_file_searches(ws, dry_run: bool) -> list:
+    """Append searches.txt URLs that aren't in the tab yet, below the last
+    used row. Never touches existing rows. Returns the [url, label] pairs
+    that were (or, in a dry run, would be) added."""
+    rows = ws.get_all_values()
+    have = {_url_key(r[0]) for r in rows[1:] if r and r[0].strip()}
+    new, seen = [], set()
+    for url, label in _file_searches():
+        key = _url_key(url)
+        if key not in have and key not in seen:
+            seen.add(key)
+            new.append([url, label])
+    if not new:
+        return []
+    for url, label in new:
+        log.info(f"searches.txt: {'would add' if dry_run else 'adding'} '{label or url}'")
+    if not dry_run:
+        first = len(rows) + 1
+        last = first + len(new) - 1
+        if last > ws.row_count:
+            ws.add_rows(last - ws.row_count)
+        ws.update(range_name=f"A{first}:B{last}", values=new)
+    return new
 
 
 # ── Sellpy ────────────────────────────────────────────────────────────────────
@@ -267,7 +320,13 @@ def run(dry_run: bool) -> bool:
         searches = [(i, dict(zip(HEADER, r + [""] * (len(HEADER) - len(r)))))
                     for i, r in enumerate(SEED_SEARCHES, start=2)]
     else:
+        added = _sync_file_searches(ws, dry_run)
         searches = _read_searches(ws)
+        if dry_run and added:
+            # Not written in a dry run: check them in memory as first runs.
+            nxt = max([r for r, _ in searches], default=1) + 1
+            searches += [(nxt + i, dict(zip(HEADER, r + [""] * (len(HEADER) - 2))))
+                         for i, r in enumerate(added)]
     log.info(f"{len(searches)} search(es) to check{' (dry run)' if dry_run else ''}.")
     if not searches:
         return True
