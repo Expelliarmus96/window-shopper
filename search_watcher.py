@@ -31,7 +31,7 @@ import os
 import re
 import sys
 import time
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
 from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
@@ -108,10 +108,13 @@ SEARCHES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "search
 
 
 def _url_key(url: str) -> str:
-    """Compare search URLs ignoring host case, trailing slash and query order."""
+    """Identity of a search: host (any case), decoded path without trailing
+    slash, and the decoded filters in any order. page and sortBy are left
+    out because the bot always sets its own sort and reads page 1."""
     parts = urlparse(url.strip())
-    q = sorted((k, v) for k, vs in parse_qs(parts.query).items() for v in vs if k != "page")
-    return f"{parts.netloc.lower()}{parts.path.rstrip('/')}?{urlencode(q)}"
+    q = sorted((k, v) for k, vs in parse_qs(parts.query).items() for v in vs
+               if k not in ("page", "sortBy"))
+    return f"{parts.netloc.lower()}{unquote(parts.path).rstrip('/')}?{urlencode(q)}"
 
 
 def _file_searches() -> list:

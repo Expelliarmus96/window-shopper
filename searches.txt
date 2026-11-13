@@ -12,3 +12,9 @@ https://www.sellpy.se/search?brand=Polartec | Polartec
 https://www.sellpy.se/search?brand=Premium+Down | Premium Down
 https://www.sellpy.se/search?brand=Primaloft | Primaloft
 https://www.sellpy.se/search?brand=Recco | Recco
+https://www.sellpy.se/search?query=onemate | Onemate
+https://www.sellpy.se/search?brand=Eloine&brand=Eluine | Eloine/Eluine
+https://www.sellpy.se/search?brand=The+Duck+Co | The Duck Co
+https://www.sellpy.se/search?query=czone | Czone
+https://www.sellpy.se/store/brand/Abercrombie%20%26%20Fitch/search/Kvinna/Kl%C3%A4der/Kl%C3%A4nningar?sizes=WMN-INT-L&sizes=WMN-INT-XL&sizes=WMN-INT-XXL | A&F klänningar L-XXL
+https://www.sellpy.se/search/Kvinna/Kl%C3%A4der/Byxor-%26-Jeans?brand=America+Today&sizes=WMN-INT-XL&sizes=WMN-INT-2XL&sizes=WMN-INT-L&sizes=WMN-EU-42&sizes=WMN-EU-40&sizes=PANTS-INCH-36&sizes=PANTS-INCH-33&sizes=PANTS-INCH-32&sizes=PANTS-INCH-31&sizes=PANTS-INCH-30&sizes=PANTS-INCH-29&sizes=PANTS-INCH-28 | America Today byxor
