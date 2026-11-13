@@ -49,7 +49,7 @@ from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
 # Reuse login, banner handling and list reading from the cart bot.
 from window_shopper import (
     BASE, EMAIL, HEADLESS, PASSWORD, SLOW_MO,
-    _close_banner, _collect_item_ids, _harvest, _login, _wait_rendered,
+    _ITEM_LINKS_JS, _close_banner, _collect_item_ids, _harvest, _login, _wait_rendered,
 )
 
 log = logging.getLogger("search_watcher")
@@ -232,6 +232,7 @@ def _search_ids(page, url: str):
         _wait_rendered(page)
         _close_banner(page)
         ids = []
+        _wait_own_tiles(page)
         _harvest(page, ids, want=30)
     finally:
         page.remove_listener("response", grab)
@@ -247,9 +248,20 @@ def _confirmed_empty(page) -> bool:
         return False
 
 
+def _wait_own_tiles(page, timeout: int = 15_000):
+    """Wait until tiles that are NOT in the recommendation carousel show up.
+    (_wait_rendered is satisfied by the carousel alone, which can load before
+    the list or search results themselves.) An empty page just times out."""
+    try:
+        page.wait_for_function(f"({_ITEM_LINKS_JS})().length > 0", timeout=timeout)
+    except PWTimeout:
+        pass
+
+
 def _list_item_ids(page) -> list:
     """Item ids in the watch list, across all its pages (carousel excluded)."""
     page.goto(LIST_URL, wait_until="load", timeout=60_000)
+    _wait_own_tiles(page)
     return _collect_item_ids(page)
 
 
@@ -552,6 +564,12 @@ def run(dry_run: bool) -> bool:
             if added_all:
                 in_list = set(_list_item_ids(page))
                 missing = [(r, i) for r, i in added_all if i not in in_list]
+                if missing:
+                    # The list can lag right after a change: look once more.
+                    log.info(f"{len(missing)} added item(s) not in the list yet — checking again in 10 s.")
+                    page.wait_for_timeout(10_000)
+                    in_list |= set(_list_item_ids(page))
+                    missing = [(r, i) for r, i in added_all if i not in in_list]
                 if missing:
                     ok_all = False
                     log.error(f"Not found in the list after adding: {[i for _, i in missing]}")
