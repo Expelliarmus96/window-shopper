@@ -37,7 +37,7 @@ from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
 # Reuse login, banner handling and list reading from the cart bot.
 from window_shopper import (
     BASE, EMAIL, HEADLESS, PASSWORD, SLOW_MO,
-    _close_banner, _collect_item_ids, _login,
+    _close_banner, _login, _page_url,
 )
 
 log = logging.getLogger("search_watcher")
@@ -111,23 +111,59 @@ def _sorted_url(url: str) -> str:
     return urlunparse(parts._replace(query=urlencode(q, doseq=True)))
 
 
-def _search_ids(page, url: str) -> list:
-    """Item ids of a search, newest first (first page only)."""
-    page.goto(_sorted_url(url), wait_until="load", timeout=60_000)
-    page.wait_for_timeout(3_000)
-    _close_banner(page)
-    ids = []
-    for _ in range(4):                        # a little scrolling for lazy tiles
-        for href in page.eval_on_selector_all(
-            "main article a[href*='/item/']", "els => els.map(e => e.getAttribute('href'))"
-        ):
-            item_id = href.rstrip("/").split("/item/")[-1].split("?")[0]
-            if item_id and item_id not in ids:
+# Item links on a page, skipping the "Du kanske också gillar" carousel
+# (data-testid="scroll-slider"), which shows up under lists and searches.
+_ITEM_LINKS_JS = """() => [...document.querySelectorAll("main article a[href*='/item/']")]
+    .filter(a => !a.closest("[data-testid='scroll-slider']"))
+    .map(a => a.getAttribute('href').split('/item/')[1].split(/[/?#]/)[0])
+    .filter(Boolean)"""
+
+
+def _wait_rendered(page):
+    """Item tiles render a few seconds after 'load'; wait for the first one."""
+    try:
+        page.wait_for_selector("main article a[href*='/item/']", timeout=15_000)
+    except PWTimeout:
+        pass
+    page.wait_for_timeout(1_500)
+
+
+def _harvest(page, ids: list, want: int = 10_000) -> int:
+    """Add the page's item ids to `ids` (scrolling for lazy tiles)."""
+    before, stable = len(ids), 0
+    for _ in range(30):
+        n = len(ids)
+        for item_id in page.evaluate(_ITEM_LINKS_JS):
+            if item_id not in ids:
                 ids.append(item_id)
-        if len(ids) >= 30:
+        stable = stable + 1 if len(ids) == n else 0
+        if stable >= 2 or len(ids) >= want:
             break
         page.mouse.wheel(0, 2_500)
         page.wait_for_timeout(700)
+    return len(ids) - before
+
+
+def _search_ids(page, url: str) -> list:
+    """Item ids of a search, newest first (first page only)."""
+    page.goto(_sorted_url(url), wait_until="load", timeout=60_000)
+    _wait_rendered(page)
+    _close_banner(page)
+    ids = []
+    _harvest(page, ids, want=30)
+    return ids
+
+
+def _list_item_ids(page) -> list:
+    """Item ids in the watch list, across all its ?page=N pages."""
+    ids = []
+    for page_no in range(1, 51):
+        page.goto(LIST_URL if page_no == 1 else _page_url(LIST_URL, page_no),
+                  wait_until="load", timeout=60_000)
+        _wait_rendered(page)
+        _close_banner(page)
+        if _harvest(page, ids) == 0:
+            break
     return ids
 
 
@@ -180,36 +216,42 @@ def _favorite_to_list(page, item_id: str, list_name: str) -> str:
         return "already a favorite (not moved)"
 
     fav.click()
-    choose = page.get_by_role("button", name="Välj lista").first
+    # Toast: "… sparad till Alla favoriter. Gå till favoriter eller lägg
+    # favoriten i en egen [lista]" — the button's text is just "lista".
+    choose = page.get_by_role("button", name="lista", exact=True).first
     try:
         choose.wait_for(state="visible", timeout=8_000)
     except PWTimeout:
         _debug_dump(page, f"notoast_{item_id}")
-        return "favorited, but 'Välj lista' didn't appear"
+        return "favorited, but the toast's 'lista' button didn't appear"
     choose.click()
 
-    dialog = page.get_by_role("dialog").last
+    # Dialog "Välj lista": one row per list, <p>name</p> + a heart button
+    # (aria-label "Lägg till i favoriter"). Names can have trailing spaces.
+    dialog = page.get_by_role("dialog", name="Välj lista").last
+    name_re = re.compile(rf"^\s*{re.escape(list_name.strip())}\s*$")
     try:
         dialog.wait_for(state="visible", timeout=8_000)
-        target = dialog.get_by_text(list_name, exact=True).first
-        target.wait_for(state="visible", timeout=8_000)
+        row_name = dialog.locator("p", has_text=name_re).first
+        row_name.wait_for(state="visible", timeout=8_000)
     except PWTimeout:
         _debug_dump(page, f"nolist_{item_id}")
         return f"favorited, but list '{list_name}' not found in the chooser"
-    target.click()
-    page.wait_for_timeout(1_500)
-
-    for name in ["Spara", "Klar", "Stäng"]:
-        btn = dialog.get_by_role("button", name=name, exact=True).first
+    heart = row_name.locator("xpath=..").locator("button:has([data-testid^='icon-HEART'])").first
+    if not heart.locator("[data-testid='icon-HEART_FILLED']").count():
+        heart.click()
         try:
-            if btn.is_visible(timeout=1_000):
-                btn.click()
-                page.wait_for_timeout(1_000)
-                break
+            heart.locator("[data-testid='icon-HEART_FILLED']").wait_for(state="attached", timeout=8_000)
         except PWTimeout:
-            pass
-    else:
+            _debug_dump(page, f"notadded_{item_id}")
+            return f"favorited, but adding to '{list_name}' wasn't confirmed"
+
+    close = dialog.get_by_role("button", name="Stäng", exact=True).first
+    try:
+        close.click(timeout=3_000)
+    except PWTimeout:
         page.keyboard.press("Escape")
+    page.wait_for_timeout(1_000)
     return "ok"
 
 
@@ -318,10 +360,7 @@ def run(dry_run: bool) -> bool:
 
             # Verify the added items really are in the list.
             if added_all:
-                page.goto(LIST_URL, wait_until="load", timeout=60_000)
-                page.wait_for_timeout(3_000)
-                _close_banner(page)
-                in_list = set(_collect_item_ids(page))
+                in_list = set(_list_item_ids(page))
                 missing = [(r, i) for r, i in added_all if i not in in_list]
                 if missing:
                     ok_all = False
