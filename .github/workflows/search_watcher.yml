@@ -1,0 +1,59 @@
+name: Search Watcher
+
+# Checks the searches in the "Search watcher" tab of the log sheet and puts
+# newly listed items into the favorites list (WATCH_LIST_URL).
+on:
+  schedule:
+    - cron: '17,47 * * * *'    # every 30 min, off the :00/:30 cart-bot runs
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only log what would be added; change nothing (not even the sheet)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: search-watcher
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium + system deps
+        run: python -m playwright install --with-deps chromium
+
+      - name: Check searches
+        env:
+          SELLPY_EMAIL: ${{ secrets.SELLPY_EMAIL }}
+          SELLPY_PASSWORD: ${{ secrets.SELLPY_PASSWORD }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          WATCH_LIST_URL: ${{ vars.WATCH_LIST_URL }}     # empty = the F4ykSR5Ys0 list
+          WATCH_LIST_NAME: ${{ vars.WATCH_LIST_NAME }}   # empty = read from the list page
+          DRY_RUN: ${{ inputs.dry_run || false }}
+        run: python search_watcher.py
+
+      - name: Upload debug files (if any)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: search-watcher-${{ github.run_id }}
+          path: |
+            watch_*.png
+            watch_*.html
+          if-no-files-found: ignore
